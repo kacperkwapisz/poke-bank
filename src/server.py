@@ -94,7 +94,7 @@ class DropNonMCPRoutes:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send):
-        if scope["type"] == "http" and not scope["path"].startswith("/mcp"):
+        if scope["type"] == "http" and not scope["path"].startswith(("/mcp", "/callback")):
             response = Response(status_code=404)
             await response(scope, receive, send)
             return
@@ -391,6 +391,30 @@ mcp = FastMCP("poke-bank", lifespan=lifespan, auth=auth)
 @mcp.custom_route("/mcp", methods=["GET"])
 async def health(request):
     return JSONResponse({"status": "ok", "service": "poke-bank"})
+
+
+@mcp.custom_route("/callback", methods=["GET"])
+async def callback(request):
+    """Handle the Enable Banking redirect after user authorization."""
+    code = request.query_params.get("code", "")
+    state = request.query_params.get("state", "")
+    if not code:
+        return Response(
+            content="<html><body><h1>Error</h1><p>Missing authorization code.</p></body></html>",
+            media_type="text/html",
+            status_code=400,
+        )
+    return Response(
+        content=(
+            "<html><body style='font-family:system-ui;max-width:480px;margin:40px auto;text-align:center'>"
+            "<h1>Authorization complete</h1>"
+            "<p>Copy the code below and pass it to <code>create_session</code> along with your <code>session_id</code>.</p>"
+            f"<pre style='background:#f3f3f3;padding:12px;border-radius:6px;word-break:break-all'>{code}</pre>"
+            "<p style='color:#666;font-size:14px'>You can close this tab.</p>"
+            "</body></html>"
+        ),
+        media_type="text/html",
+    )
 
 
 # ---------------------------------------------------------------------------
