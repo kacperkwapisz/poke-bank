@@ -91,6 +91,8 @@ To connect US bank accounts, you need a [Teller](https://teller.io) application:
    ```
 
 > **Note:** Sandbox mode works without mTLS certificates and provides test data. You get 100 free enrollments on the developer plan.
+>
+> **Note:** You can also inline the PEM strings directly in `TELLER_CERT` and `TELLER_KEY` instead of pointing to file paths (use `\n` for newlines).
 
 ## Manual Setup
 
@@ -208,8 +210,8 @@ All other paths return 404.
 | `POKE_API_KEY` | No | API key for Poke webhook authentication |
 | `TELLER_APP_ID` | No | Teller application ID (enables US bank support via Teller) |
 | `TELLER_ENV` | No | Teller environment: `sandbox`, `development`, or `production` (default: `sandbox`) |
-| `TELLER_CERT` | No | Path to Teller mTLS certificate PEM file (required for development/production) |
-| `TELLER_KEY` | No | Path to Teller mTLS private key PEM file (required for development/production) |
+| `TELLER_CERT` | No | Teller mTLS certificate — file path or inline PEM string (required for development/production) |
+| `TELLER_KEY` | No | Teller mTLS private key — file path or inline PEM string (required for development/production) |
 | `POKE_TUNNEL` | No | Set to `1` when using the Poke tunnel (disables MCP_API_KEY requirement) |
 | `HOST_PORT` | No | Exposed port on the host (default: 3000) |
 | `PORT` | No | Server port inside the container (default: 3000) |

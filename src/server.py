@@ -46,11 +46,30 @@ POKE_API_KEY = os.environ.get("POKE_API_KEY", "")
 TELLER_APP_ID = os.environ.get("TELLER_APP_ID", "")
 TELLER_ENV = os.environ.get("TELLER_ENV", "sandbox")  # sandbox | development | production
 
-# mTLS certificate for Teller API — PEM file paths
+# mTLS certificate for Teller API — PEM file paths or inline PEM strings
 _teller_cert_raw = os.environ.get("TELLER_CERT", "")
 _teller_key_raw = os.environ.get("TELLER_KEY", "")
-TELLER_CERT = _teller_cert_raw if os.path.isfile(_teller_cert_raw) else None
-TELLER_KEY = _teller_key_raw if os.path.isfile(_teller_key_raw) else None
+
+
+def _resolve_pem(raw: str) -> str | None:
+    """Return a file path for a PEM value (file path or inline string)."""
+    if not raw:
+        return None
+    if os.path.isfile(raw):
+        return raw
+    # Treat as inline PEM — handle escaped newlines from env vars / Docker
+    content = raw.replace("\\n", "\n")
+    if "BEGIN" not in content:
+        return None
+    import tempfile
+    f = tempfile.NamedTemporaryFile(mode="w", suffix=".pem", delete=False)
+    f.write(content)
+    f.close()
+    return f.name
+
+
+TELLER_CERT = _resolve_pem(_teller_cert_raw)
+TELLER_KEY = _resolve_pem(_teller_key_raw)
 
 TELLER_API_BASE = "https://api.teller.io"
 
