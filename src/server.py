@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
 """poke-bank — FastMCP server exposing Enable Banking as MCP tools."""
-import asyncio
+
 import base64
-import hashlib
 import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
+import jwt
 import uvicorn
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from fastmcp import FastMCP, Context
@@ -33,9 +35,20 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 ENABLE_BANKING_BASE = os.environ.get(
     "ENABLE_BANKING_BASE", "https://api.enablebanking.com"
 )
-CLIENT_ID = os.environ.get("ENABLE_BANKING_CLIENT_ID", "")
-CLIENT_SECRET = os.environ.get("ENABLE_BANKING_CLIENT_SECRET", "")
+APP_ID = os.environ.get("ENABLE_BANKING_APP_ID", "")
 REDIRECT_URI = os.environ.get("ENABLE_BANKING_REDIRECT_URI", "")
+
+# RSA private key for signing JWTs — PEM string or path to file.
+_pk_raw = os.environ.get("ENABLE_BANKING_PRIVATE_KEY", "")
+if _pk_raw and os.path.isfile(_pk_raw):
+    with open(_pk_raw) as f:
+        PRIVATE_KEY = f.read()
+else:
+    # Handle escaped newlines from env vars / Docker
+    PRIVATE_KEY = _pk_raw.replace("\\n", "\n")
+
+# Default consent validity in days.
+CONSENT_VALIDITY_DAYS = int(os.environ.get("CONSENT_VALIDITY_DAYS", "90"))
 
 DB_PATH = os.environ.get("DB_PATH", "/data/sessions.db")
 
@@ -250,64 +263,60 @@ def session_delete(session_id: str, db_path: str = DB_PATH) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Enable Banking OAuth2 helpers
+# Enable Banking API helpers
 # ---------------------------------------------------------------------------
 
 
-def _make_pkce() -> tuple[str, str]:
-    """Generate PKCE code_verifier and code_challenge (S256)."""
-    verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
-    digest = hashlib.sha256(verifier.encode()).digest()
-    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
-    return verifier, challenge
+def _make_jwt() -> str:
+    """Create a short-lived RS256 JWT for Enable Banking API authentication."""
+    now = int(time.time())
+    payload = {
+        "iss": "enablebanking.com",
+        "aud": "api.enablebanking.com",
+        "iat": now,
+        "exp": now + 600,  # 10 minutes
+    }
+    return jwt.encode(payload, PRIVATE_KEY, algorithm="RS256", headers={"kid": APP_ID})
 
 
-async def _token_request(payload: dict) -> dict:
-    """POST to the Enable Banking token endpoint."""
+def _api_headers() -> dict[str, str]:
+    """Return authorization headers for Enable Banking API requests."""
+    return {
+        "Authorization": f"Bearer {_make_jwt()}",
+        "Content-Type": "application/json",
+    }
+
+
+async def _api_post(path: str, body: dict) -> dict:
+    """POST JSON to the Enable Banking API."""
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
-            f"{ENABLE_BANKING_BASE}/token",
-            data=payload,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            f"{ENABLE_BANKING_BASE}{path}",
+            json=body,
+            headers=_api_headers(),
         )
         resp.raise_for_status()
         return resp.json()
 
 
-async def _api_get(path: str, access_token: str, params: Optional[dict] = None) -> dict:
+async def _api_get(path: str, params: Optional[dict] = None) -> dict:
     """GET request to the Enable Banking API."""
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.get(
             f"{ENABLE_BANKING_BASE}{path}",
             params=params,
-            headers={"Authorization": f"Bearer {access_token}"},
+            headers=_api_headers(),
         )
         resp.raise_for_status()
         return resp.json()
 
 
-async def _refresh_if_needed(session: dict) -> dict:
-    """Refresh the access token if it's within 60 seconds of expiry."""
-    expires_at = session.get("expires_at", 0)
-    if time.time() < expires_at - 60:
-        return session  # still valid
-    refresh_token = session.get("refresh_token")
-    if not refresh_token:
-        raise ValueError("Session has no refresh_token and access token has expired.")
-    token_data = await _token_request(
-        {
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-        }
-    )
-    session["access_token"] = token_data["access_token"]
-    session["expires_at"] = int(time.time()) + token_data.get("expires_in", 3600)
-    if "refresh_token" in token_data:
-        session["refresh_token"] = token_data["refresh_token"]
-    session_save(session["session_id"], session)
-    return session
+# UUID or hex string — rejects path traversal characters.
+_ACCOUNT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def _valid_account_id(account_id: str) -> bool:
+    return bool(account_id and _ACCOUNT_ID_RE.match(account_id))
 
 
 # ---------------------------------------------------------------------------
@@ -315,9 +324,43 @@ async def _refresh_if_needed(session: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
+# Incomplete sessions older than this (seconds) are purged on startup.
+_STALE_SESSION_AGE = 24 * 3600  # 1 day
+
+
+def _purge_stale_sessions(db_path: str = DB_PATH) -> int:
+    """Delete sessions older than _STALE_SESSION_AGE that were never activated."""
+    cutoff = int(time.time()) - _STALE_SESSION_AGE
+    conn = sqlite3.connect(db_path)
+    deleted = 0
+    try:
+        rows = conn.execute(
+            "SELECT session_id, encrypted_data FROM sessions WHERE updated_at < ?",
+            (cutoff,),
+        ).fetchall()
+        for sid, blob in rows:
+            try:
+                data = json.loads(_decrypt(blob))
+            except Exception:
+                # Can't decrypt — stale, delete it
+                conn.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
+                deleted += 1
+                continue
+            if not data.get("eb_session_id"):
+                conn.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
+                deleted += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return deleted
+
+
 @asynccontextmanager
 async def lifespan(server: FastMCP):
     _db_init(DB_PATH)
+    purged = _purge_stale_sessions()
+    if purged:
+        logger.info("Purged %d stale sessions", purged)
     logger.info("poke-bank started (DB: %s)", DB_PATH)
     yield {}
     logger.info("poke-bank shut down")
@@ -357,9 +400,9 @@ async def health(request):
 
 @mcp.tool(
     description=(
-        "Start the Enable Banking OAuth2 flow. Returns an authorization URL "
+        "Start the Enable Banking authorization flow. Returns an authorization URL "
         "that the user must open in their browser to grant access to their bank accounts. "
-        "Also returns a session_id that you must pass to exchange_code after the redirect."
+        "Also returns a session_id that you must pass to create_session after the redirect."
     )
 )
 async def get_auth_url(
@@ -367,74 +410,90 @@ async def get_auth_url(
     aspsp_name: str,
     aspsp_country: str,
     psu_type: str = "personal",
+    consent_days: int = CONSENT_VALIDITY_DAYS,
 ) -> dict:
     """
-    Generate an Enable Banking OAuth2 authorization URL.
+    Start Enable Banking authorization — get a URL for the user to open.
 
     Args:
         aspsp_name: Bank / ASPSP name (e.g. 'Nordea', 'ING', 'Revolut').
         aspsp_country: Two-letter ISO country code of the bank (e.g. 'FI', 'DE', 'GB').
         psu_type: Payment service user type — 'personal' or 'business'. Default: 'personal'.
+        consent_days: How many days the consent should be valid. Default from CONSENT_VALIDITY_DAYS env var.
 
     Returns:
         auth_url: URL the user must open to authorize access.
-        session_id: Opaque identifier — keep this, you'll need it for exchange_code.
+        session_id: Opaque identifier — keep this, you'll need it for create_session.
     """
-    if not CLIENT_ID or not REDIRECT_URI:
-        return {"error": "ENABLE_BANKING_CLIENT_ID or ENABLE_BANKING_REDIRECT_URI not configured."}
+    if not APP_ID or not PRIVATE_KEY:
+        return {
+            "error": "ENABLE_BANKING_APP_ID and ENABLE_BANKING_PRIVATE_KEY must be set."
+        }
+    if not REDIRECT_URI:
+        return {"error": "ENABLE_BANKING_REDIRECT_URI must be set."}
 
     state = secrets.token_urlsafe(24)
-    verifier, challenge = _make_pkce()
-    session_id = secrets.token_urlsafe(32)
+    local_session_id = secrets.token_urlsafe(32)
+    valid_until = (
+        datetime.now(timezone.utc) + timedelta(days=consent_days)
+    ).isoformat()
 
-    # Persist pending session so exchange_code can retrieve the verifier
+    body = {
+        "access": {"valid_until": valid_until},
+        "aspsp": {"name": aspsp_name, "country": aspsp_country},
+        "state": state,
+        "redirect_url": REDIRECT_URI,
+        "psu_type": psu_type,
+    }
+
+    try:
+        data = await _api_post("/auth", body)
+    except httpx.HTTPStatusError as e:
+        return {
+            "error": f"Enable Banking /auth failed: {e.response.status_code} {e.response.text}"
+        }
+    except httpx.RequestError as e:
+        return {"error": f"Network error contacting Enable Banking: {e}"}
+
+    auth_url = data.get("url", "")
+    authorization_id = data.get("authorization_id", "")
+
     session_save(
-        session_id,
+        local_session_id,
         {
-            "session_id": session_id,
+            "session_id": local_session_id,
             "state": state,
-            "code_verifier": verifier,
+            "authorization_id": authorization_id,
             "aspsp_name": aspsp_name,
             "aspsp_country": aspsp_country,
         },
     )
 
-    params = {
-        "client_id": CLIENT_ID,
-        "response_type": "code",
-        "redirect_uri": REDIRECT_URI,
-        "scope": "aisp",
-        "state": state,
-        "code_challenge": challenge,
-        "code_challenge_method": "S256",
-        "aspsp_name": aspsp_name,
-        "aspsp_country": aspsp_country,
-        "psu_type": psu_type,
-    }
-    query = "&".join(f"{k}={v}" for k, v in params.items())
-    auth_url = f"{ENABLE_BANKING_BASE}/auth?{query}"
-
     return {
         "auth_url": auth_url,
-        "session_id": session_id,
-        "instructions": "Open auth_url in a browser. After authorizing, you'll be redirected to the redirect_uri with ?code=...&state=... — pass the code and session_id to exchange_code.",
+        "session_id": local_session_id,
+        "instructions": (
+            "Open auth_url in a browser. After authorizing, you'll be redirected "
+            "to the redirect_url with ?code=... — pass the code and this session_id "
+            "to create_session."
+        ),
     }
 
 
 @mcp.tool(
     description=(
-        "Exchange the authorization code received after the OAuth2 redirect for "
-        "an access token. Pass the code from the redirect URL and the session_id "
-        "returned by get_auth_url. Stores tokens encrypted in the local SQLite store."
+        "Create an Enable Banking session using the authorization code from the redirect. "
+        "Pass the code from the redirect URL and the session_id returned by get_auth_url. "
+        "Returns the list of authorized bank accounts."
     )
 )
-async def exchange_code(
+async def create_session(
     ctx: Context,
     code: str,
     session_id: str,
 ) -> dict:
     """
-    Exchange OAuth2 authorization code for access + refresh tokens.
+    Exchange the authorization code for an Enable Banking session.
 
     Args:
         code: The 'code' query parameter from the Enable Banking redirect URL.
@@ -443,45 +502,43 @@ async def exchange_code(
     Returns:
         success: True on success.
         session_id: Same session_id — use it with list_accounts, get_transactions, get_balances.
-        expires_at: Unix timestamp when the access token expires.
+        accounts: List of authorized bank accounts.
     """
     session = session_load(session_id)
     if not session:
         return {"error": f"Session '{session_id}' not found. Call get_auth_url first."}
 
     try:
-        token_data = await _token_request(
-            {
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": REDIRECT_URI,
-                "client_id": CLIENT_ID,
-                "client_secret": CLIENT_SECRET,
-                "code_verifier": session["code_verifier"],
-            }
-        )
+        data = await _api_post("/sessions", {"code": code})
     except httpx.HTTPStatusError as e:
-        return {"error": f"Token exchange failed: {e.response.status_code} {e.response.text}"}
+        return {
+            "error": f"Session creation failed: {e.response.status_code} {e.response.text}"
+        }
+    except httpx.RequestError as e:
+        return {"error": f"Network error contacting Enable Banking: {e}"}
 
-    session["access_token"] = token_data["access_token"]
-    session["expires_at"] = int(time.time()) + token_data.get("expires_in", 3600)
-    session["refresh_token"] = token_data.get("refresh_token", "")
-    # Remove PKCE verifier — no longer needed
-    session.pop("code_verifier", None)
+    # Enable Banking returns a session_id and accounts list
+    eb_session_id = data.get("session_id", data.get("sessionId", ""))
+    accounts = data.get("accounts", [])
+
+    session["eb_session_id"] = eb_session_id
+    session["accounts"] = accounts
+    # Clean up auth-only fields
     session.pop("state", None)
+    session.pop("authorization_id", None)
     session_save(session_id, session)
 
     return {
         "success": True,
         "session_id": session_id,
-        "expires_at": session["expires_at"],
+        "accounts": accounts,
     }
 
 
 @mcp.tool(
     description=(
         "List all bank accounts accessible via the given session. "
-        "Call exchange_code first to obtain a valid session_id."
+        "Call create_session first to obtain a valid session_id."
     )
 )
 async def list_accounts(
@@ -492,24 +549,20 @@ async def list_accounts(
     List all accounts linked to the Enable Banking session.
 
     Args:
-        session_id: Session identifier from exchange_code.
+        session_id: Session identifier from create_session.
 
     Returns:
-        accounts: List of account objects (id, iban, currency, name, type, etc.).
+        accounts: List of account objects (uid, iban, currency, name, type, etc.).
     """
     session = session_load(session_id)
     if not session:
         return {"error": f"Session '{session_id}' not found."}
 
-    try:
-        session = await _refresh_if_needed(session)
-        data = await _api_get("/accounts", session["access_token"])
-    except httpx.HTTPStatusError as e:
-        return {"error": f"API error: {e.response.status_code} {e.response.text}"}
-    except ValueError as e:
-        return {"error": str(e)}
+    accounts = session.get("accounts")
+    if accounts is not None:
+        return {"accounts": accounts}
 
-    return {"accounts": data.get("accounts", data)}
+    return {"error": "No accounts in session. Call create_session first."}
 
 
 @mcp.tool(
@@ -529,8 +582,8 @@ async def get_transactions(
     Get transactions for a bank account.
 
     Args:
-        session_id: Session identifier from exchange_code.
-        account_id: Account identifier from list_accounts.
+        session_id: Session identifier from create_session.
+        account_id: Account uid from list_accounts.
         date_from: Start date filter (YYYY-MM-DD). Optional.
         date_to: End date filter (YYYY-MM-DD). Optional.
 
@@ -540,9 +593,12 @@ async def get_transactions(
     session = session_load(session_id)
     if not session:
         return {"error": f"Session '{session_id}' not found."}
+    if not session.get("eb_session_id"):
+        return {"error": "Session not activated. Call create_session first."}
+    if not _valid_account_id(account_id):
+        return {"error": "Invalid account_id."}
 
     try:
-        session = await _refresh_if_needed(session)
         params: dict = {}
         if date_from:
             params["date_from"] = date_from
@@ -550,22 +606,17 @@ async def get_transactions(
             params["date_to"] = date_to
         data = await _api_get(
             f"/accounts/{account_id}/transactions",
-            session["access_token"],
             params=params or None,
         )
     except httpx.HTTPStatusError as e:
         return {"error": f"API error: {e.response.status_code} {e.response.text}"}
-    except ValueError as e:
-        return {"error": str(e)}
+    except httpx.RequestError as e:
+        return {"error": f"Network error: {e}"}
 
     return {"transactions": data.get("transactions", data)}
 
 
-@mcp.tool(
-    description=(
-        "Get current balances for a specific bank account."
-    )
-)
+@mcp.tool(description="Get current balances for a specific bank account.")
 async def get_balances(
     ctx: Context,
     session_id: str,
@@ -575,8 +626,8 @@ async def get_balances(
     Get balances for a bank account.
 
     Args:
-        session_id: Session identifier from exchange_code.
-        account_id: Account identifier from list_accounts.
+        session_id: Session identifier from create_session.
+        account_id: Account uid from list_accounts.
 
     Returns:
         balances: List of balance objects (type, amount, currency).
@@ -584,19 +635,19 @@ async def get_balances(
     session = session_load(session_id)
     if not session:
         return {"error": f"Session '{session_id}' not found."}
+    if not session.get("eb_session_id"):
+        return {"error": "Session not activated. Call create_session first."}
+    if not _valid_account_id(account_id):
+        return {"error": "Invalid account_id."}
 
     try:
-        session = await _refresh_if_needed(session)
-        data = await _api_get(
-            f"/accounts/{account_id}/balances",
-            session["access_token"],
-        )
+        data = await _api_get(f"/accounts/{account_id}/balances")
     except httpx.HTTPStatusError as e:
         return {"error": f"API error: {e.response.status_code} {e.response.text}"}
-    except ValueError as e:
-        return {"error": str(e)}
+    except httpx.RequestError as e:
+        return {"error": f"Network error: {e}"}
 
-    return {"balances": data.get("balances", data)}
+    return {"balances": data.get("balances", data.get("balance", data))}
 
 
 # ---------------------------------------------------------------------------

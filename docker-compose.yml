@@ -8,9 +8,9 @@ services:
       # Required: bearer token for MCP clients
       MCP_API_KEY: ${MCP_API_KEY}
 
-      # Enable Banking OAuth2 credentials
-      ENABLE_BANKING_CLIENT_ID: ${ENABLE_BANKING_CLIENT_ID}
-      ENABLE_BANKING_CLIENT_SECRET: ${ENABLE_BANKING_CLIENT_SECRET}
+      # Enable Banking credentials (JWT-based auth)
+      ENABLE_BANKING_APP_ID: ${ENABLE_BANKING_APP_ID}
+      ENABLE_BANKING_PRIVATE_KEY: ${ENABLE_BANKING_PRIVATE_KEY}
       ENABLE_BANKING_REDIRECT_URI: ${ENABLE_BANKING_REDIRECT_URI}
 
       # Optional: override the Enable Banking API base URL (for sandbox)
