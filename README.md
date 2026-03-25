@@ -28,6 +28,16 @@ The server listens on port `3000` (configurable via `HOST_PORT` in `.env`).
 
 MCP endpoint: `http://your-vps:3000/mcp`
 
+## Routes
+
+| Path | Method | Description |
+|---|---|---|
+| `/mcp` | GET | Health check — returns `{"status": "ok"}` |
+| `/mcp` | POST | MCP protocol endpoint |
+| `/callback` | GET | Enable Banking redirect — auto-completes the authorization flow |
+
+All other paths return 404.
+
 ## Configuration
 
 All config is via environment variables (or `.env` file for Docker Compose).
@@ -44,6 +54,8 @@ All config is via environment variables (or `.env` file for Docker Compose).
 | `DB_PATH` | No | SQLite path — defaults to `/data/sessions.db` |
 | `RATE_LIMIT_GET_RPM` | No | GET rate limit per IP (default: 30) |
 | `RATE_LIMIT_POST_RPM` | No | POST rate limit per IP (default: 120) |
+| `POKE_WEBHOOK_URL` | No | Webhook URL to notify Poke when a bank account is connected |
+| `POKE_API_KEY` | No | API key for Poke webhook authentication |
 | `POKE_TUNNEL` | No | Set to `1` when using the Poke tunnel (disables MCP_API_KEY requirement) |
 | `PORT` | No | Server port inside the container (default: 3000) |
 
@@ -76,9 +88,12 @@ All session data is encrypted with AES-256-GCM using the `SESSION_ENCRYPTION_KEY
 
 1. Call `get_auth_url` with the bank name and country code
 2. Open the returned `auth_url` in a browser and authorize
-3. After the redirect, copy the `code` from the URL
-4. Call `create_session` with the `code` and `session_id`
-5. Use `list_accounts`, `get_transactions`, `get_balances` with the `session_id`
+3. The bank redirects to `/callback` which auto-completes the session — no manual code copying needed
+4. Use `list_accounts`, `get_transactions`, `get_balances` with the `session_id`
+
+If `POKE_WEBHOOK_URL` and `POKE_API_KEY` are set, a webhook is sent to Poke when a bank account is successfully connected.
+
+> **Fallback:** If the callback redirect doesn't work, you can also manually copy the `code` from the redirect URL and call `create_session` with the `code` and `session_id`.
 
 ## License
 
