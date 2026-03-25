@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """poke-bank — FastMCP server exposing Enable Banking as MCP tools."""
 
+import asyncio
 import base64
 import hmac
 import json
@@ -37,6 +38,8 @@ ENABLE_BANKING_BASE = os.environ.get(
 )
 APP_ID = os.environ.get("ENABLE_BANKING_APP_ID", "")
 REDIRECT_URI = os.environ.get("ENABLE_BANKING_REDIRECT_URI", "")
+POKE_WEBHOOK_URL = os.environ.get("POKE_WEBHOOK_URL", "https://poke.com/api/v1/inbound/api-message")
+POKE_API_KEY = os.environ.get("POKE_API_KEY", "")
 
 # RSA private key for signing JWTs — PEM string or path to file.
 _pk_raw = os.environ.get("ENABLE_BANKING_PRIVATE_KEY", "")
@@ -410,6 +413,42 @@ async def health(request):
     return JSONResponse({"status": "ok", "service": "poke-bank"})
 
 
+async def forward_to_poke(session_id: str, session: dict, accounts: list) -> bool:
+    """Send a webhook to Poke when a bank account is connected."""
+    payload = {
+        "event": "bank_account_connected",
+        "session_id": session_id,
+        "aspsp_name": session.get("aspsp_name", ""),
+        "aspsp_country": session.get("aspsp_country", ""),
+        "account_count": len(accounts),
+        "accounts": [
+            {
+                "uid": acc.get("uid"),
+                "iban": acc.get("iban"),
+                "currency": acc.get("currency"),
+                "name": acc.get("account_name") or acc.get("name"),
+            }
+            for acc in accounts
+        ],
+        "connected_at": datetime.now(timezone.utc).isoformat(),
+    }
+    headers = {"Content-Type": "application/json"}
+    headers["Authorization"] = f"Bearer {POKE_API_KEY}"
+
+    for attempt in range(2):
+        try:
+            async with httpx.AsyncClient(timeout=30) as http:
+                resp = await http.post(POKE_WEBHOOK_URL, json=payload, headers=headers)
+                resp.raise_for_status()
+                logger.info("Webhook sent to Poke (status %d)", resp.status_code)
+                return True
+        except Exception as e:
+            logger.warning("Poke webhook attempt %d failed: %s", attempt + 1, e)
+            if attempt == 0:
+                await asyncio.sleep(2)
+    return False
+
+
 @mcp.custom_route("/callback", methods=["GET"])
 async def callback(request):
     """Handle the Enable Banking redirect — auto-complete the session."""
@@ -465,6 +504,9 @@ async def callback(request):
     session.pop("state", None)
     session.pop("authorization_id", None)
     session_save(session_id, session)
+
+    if POKE_API_KEY:
+        asyncio.create_task(forward_to_poke(session_id, session, accounts))
 
     account_count = len(accounts)
     return Response(
