@@ -1,0 +1,35 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[codz]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Environments
+.env
+.venv
+env/
+venv/
+
+# SQLite database (runtime data)
+*.db
+*.sqlite3
+
+# Ruff
+.ruff_cache/
+
+# mypy
+.mypy_cache/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/

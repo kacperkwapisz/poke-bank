@@ -1,0 +1,35 @@
+services:
+  poke-bank:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-3000}:3000"
+    environment:
+      # Required: bearer token for MCP clients
+      MCP_API_KEY: ${MCP_API_KEY}
+
+      # Enable Banking OAuth2 credentials
+      ENABLE_BANKING_CLIENT_ID: ${ENABLE_BANKING_CLIENT_ID}
+      ENABLE_BANKING_CLIENT_SECRET: ${ENABLE_BANKING_CLIENT_SECRET}
+      ENABLE_BANKING_REDIRECT_URI: ${ENABLE_BANKING_REDIRECT_URI}
+
+      # Optional: override the Enable Banking API base URL (for sandbox)
+      # ENABLE_BANKING_BASE: https://api.tilisy.com
+
+      # Encryption key for the SQLite session store (64 hex chars = 32 bytes)
+      # Generate with: python -c "import secrets; print(secrets.token_hex(32))"
+      SESSION_ENCRYPTION_KEY: ${SESSION_ENCRYPTION_KEY}
+
+      # Optional: rate limit overrides
+      # RATE_LIMIT_GET_RPM: 30
+      # RATE_LIMIT_POST_RPM: 120
+
+      # Optional: use Poke tunnel auth instead of MCP_API_KEY
+      # POKE_TUNNEL: 1
+
+      PORT: 3000
+    volumes:
+      - poke-bank-data:/data
+
+volumes:
+  poke-bank-data:
