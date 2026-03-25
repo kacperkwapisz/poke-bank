@@ -27,9 +27,18 @@ services:
       # Optional: use Poke tunnel auth instead of MCP_API_KEY
       # POKE_TUNNEL: 1
 
+      # Teller credentials (optional — for US bank support)
+      # TELLER_APP_ID: ${TELLER_APP_ID}
+      # TELLER_ENV: ${TELLER_ENV:-sandbox}
+      # Teller mTLS certificate paths (required for development/production)
+      # TELLER_CERT: /certs/certificate.pem
+      # TELLER_KEY: /certs/private_key.pem
+
       PORT: 3000
     volumes:
       - poke-bank-data:/data
+      # Uncomment to mount Teller mTLS certificates
+      # - ./certs/teller:/certs:ro
 
 volumes:
   poke-bank-data:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""poke-bank — FastMCP server exposing Enable Banking as MCP tools."""
+"""poke-bank — FastMCP server exposing Enable Banking and Teller as MCP tools."""
 
 import asyncio
 import base64
@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 import sqlite3
+import ssl
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -40,6 +41,18 @@ APP_ID = os.environ.get("ENABLE_BANKING_APP_ID", "")
 REDIRECT_URI = os.environ.get("ENABLE_BANKING_REDIRECT_URI", "")
 POKE_WEBHOOK_URL = os.environ.get("POKE_WEBHOOK_URL", "https://poke.com/api/v1/inbound/api-message")
 POKE_API_KEY = os.environ.get("POKE_API_KEY", "")
+
+# Teller credentials (optional — for US bank support)
+TELLER_APP_ID = os.environ.get("TELLER_APP_ID", "")
+TELLER_ENV = os.environ.get("TELLER_ENV", "sandbox")  # sandbox | development | production
+
+# mTLS certificate for Teller API — PEM file paths
+_teller_cert_raw = os.environ.get("TELLER_CERT", "")
+_teller_key_raw = os.environ.get("TELLER_KEY", "")
+TELLER_CERT = _teller_cert_raw if os.path.isfile(_teller_cert_raw) else None
+TELLER_KEY = _teller_key_raw if os.path.isfile(_teller_key_raw) else None
+
+TELLER_API_BASE = "https://api.teller.io"
 
 # RSA private key for signing JWTs — PEM string or path to file.
 _pk_raw = os.environ.get("ENABLE_BANKING_PRIVATE_KEY", "")
@@ -97,7 +110,7 @@ class DropNonMCPRoutes:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send):
-        if scope["type"] == "http" and not scope["path"].startswith(("/mcp", "/callback")):
+        if scope["type"] == "http" and not scope["path"].startswith(("/mcp", "/callback", "/connect")):
             response = Response(status_code=404)
             await response(scope, receive, send)
             return
@@ -343,6 +356,25 @@ async def _get_max_consent_seconds(aspsp_name: str, aspsp_country: str) -> Optio
     return None
 
 
+# ---------------------------------------------------------------------------
+# Teller API helpers
+# ---------------------------------------------------------------------------
+
+
+async def _teller_get(path: str, access_token: str) -> list | dict:
+    """GET from Teller API with mTLS + HTTP Basic Auth."""
+    auth = httpx.BasicAuth(username=access_token, password="")
+    kwargs: dict = {"timeout": 30, "auth": auth}
+    if TELLER_CERT and TELLER_KEY:
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.load_cert_chain(certfile=TELLER_CERT, keyfile=TELLER_KEY)
+        kwargs["verify"] = ssl_ctx
+    async with httpx.AsyncClient(**kwargs) as client:
+        resp = await client.get(f"{TELLER_API_BASE}{path}")
+        resp.raise_for_status()
+        return resp.json()
+
+
 # UUID or hex string — rejects path traversal characters.
 _ACCOUNT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
@@ -378,7 +410,7 @@ def _purge_stale_sessions(db_path: str = DB_PATH) -> int:
                 conn.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
                 deleted += 1
                 continue
-            if not data.get("eb_session_id"):
+            if not data.get("eb_session_id") and not data.get("teller_access_token"):
                 conn.execute("DELETE FROM sessions WHERE session_id = ?", (sid,))
                 deleted += 1
         conn.commit()
@@ -393,6 +425,14 @@ async def lifespan(server: FastMCP):
     purged = _purge_stale_sessions()
     if purged:
         logger.info("Purged %d stale sessions", purged)
+    if TELLER_APP_ID:
+        logger.info("Teller enabled (env: %s)", TELLER_ENV)
+        if TELLER_ENV != "sandbox" and (not TELLER_CERT or not TELLER_KEY):
+            logger.warning(
+                "Teller env is '%s' but TELLER_CERT/TELLER_KEY not set — "
+                "API calls will fail without mTLS certificates.",
+                TELLER_ENV,
+            )
     logger.info("poke-bank started (DB: %s)", DB_PATH)
     yield {}
     logger.info("poke-bank shut down")
@@ -427,13 +467,23 @@ async def health(request):
 
 async def forward_to_poke(session_id: str, session: dict, accounts: list) -> bool:
     """Send a webhook to Poke when a bank account is connected."""
-    payload = {
-        "event": "bank_account_connected",
-        "session_id": session_id,
-        "aspsp_name": session.get("aspsp_name", ""),
-        "aspsp_country": session.get("aspsp_country", ""),
-        "account_count": len(accounts),
-        "accounts": [
+    provider = session.get("provider", "enable_banking")
+    if provider == "teller":
+        aspsp_name = session.get("institution_name", "Teller")
+        aspsp_country = "US"
+        account_items = [
+            {
+                "uid": acc.get("id"),
+                "iban": None,
+                "currency": acc.get("currency", "USD"),
+                "name": acc.get("name"),
+            }
+            for acc in accounts
+        ]
+    else:
+        aspsp_name = session.get("aspsp_name", "")
+        aspsp_country = session.get("aspsp_country", "")
+        account_items = [
             {
                 "uid": acc.get("uid"),
                 "iban": acc.get("iban"),
@@ -441,7 +491,14 @@ async def forward_to_poke(session_id: str, session: dict, accounts: list) -> boo
                 "name": acc.get("account_name") or acc.get("name"),
             }
             for acc in accounts
-        ],
+        ]
+    payload = {
+        "event": "bank_account_connected",
+        "session_id": session_id,
+        "aspsp_name": aspsp_name,
+        "aspsp_country": aspsp_country,
+        "account_count": len(accounts),
+        "accounts": account_items,
         "connected_at": datetime.now(timezone.utc).isoformat(),
     }
     headers = {"Content-Type": "application/json"}
@@ -533,6 +590,168 @@ async def callback(request):
     )
 
 
+@mcp.custom_route("/connect/teller", methods=["GET"])
+async def connect_teller(request):
+    """Serve the Teller Connect widget page."""
+    session_id = request.query_params.get("session_id", "")
+
+    _page = (
+        "<html><body style='font-family:system-ui;max-width:480px;margin:40px auto;text-align:center'>"
+        "{body}</body></html>"
+    )
+
+    if not session_id:
+        return Response(
+            content=_page.format(body="<h1>Error</h1><p>Missing session_id parameter.</p>"),
+            media_type="text/html",
+            status_code=400,
+        )
+
+    session = session_load(session_id)
+    if not session or session.get("provider") != "teller":
+        return Response(
+            content=_page.format(body="<h1>Error</h1><p>Session not found or expired.</p>"),
+            media_type="text/html",
+            status_code=404,
+        )
+
+    # Reject already-activated sessions
+    if session.get("teller_access_token"):
+        return Response(
+            content=_page.format(
+                body="<h1>Already Connected</h1><p>This session is already linked. You can close this tab.</p>"
+            ),
+            media_type="text/html",
+        )
+
+    # Build the callback URL from the request origin
+    scheme = request.headers.get("x-forwarded-proto", request.url.scheme or "http")
+    host = request.headers.get("host", "localhost")
+    callback_url = f"{scheme}://{host}/callback/teller"
+
+    # Escape values for safe embedding in JS string literals
+    def _js_escape(s: str) -> str:
+        return s.replace("\\", "\\\\").replace('"', '\\"').replace("'", "\\'").replace("\n", "\\n").replace("<", "\\x3c")
+
+    safe_app_id = _js_escape(TELLER_APP_ID)
+    safe_env = _js_escape(TELLER_ENV)
+    safe_session_id = _js_escape(session_id)
+    safe_callback = _js_escape(callback_url)
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Connect Bank Account</title>
+<style>
+  body {{ font-family: system-ui; max-width: 480px; margin: 40px auto; text-align: center; }}
+  #status {{ margin-top: 20px; color: #666; font-size: 14px; }}
+  #error {{ color: #c00; display: none; margin-top: 20px; }}
+</style>
+</head>
+<body>
+<h1 id="heading">Connecting...</h1>
+<p id="status">Loading Teller Connect...</p>
+<p id="error"></p>
+<script src="https://cdn.teller.io/connect/connect.js"></script>
+<script>
+  var tellerConnect = TellerConnect.setup({{
+    applicationId: "{safe_app_id}",
+    environment: "{safe_env}",
+    onInit: function() {{
+      document.getElementById("status").textContent = "Select your bank...";
+    }},
+    onSuccess: function(enrollment) {{
+      document.getElementById("heading").textContent = "Connecting...";
+      document.getElementById("status").textContent = "Saving your connection...";
+      fetch("{safe_callback}", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{
+          session_id: "{safe_session_id}",
+          access_token: enrollment.accessToken,
+          enrollment_id: enrollment.enrollment.id,
+          institution_name: enrollment.enrollment.institution.name
+        }})
+      }}).then(function(r) {{ return r.json(); }})
+        .then(function(data) {{
+          if (data.success) {{
+            document.getElementById("heading").textContent = "Connected";
+            document.getElementById("status").textContent =
+              data.account_count + " account" + (data.account_count !== 1 ? "s" : "") + " linked. You can close this tab.";
+          }} else {{
+            document.getElementById("heading").textContent = "Error";
+            document.getElementById("error").style.display = "block";
+            document.getElementById("error").textContent = data.error || "Connection failed.";
+            document.getElementById("status").textContent = "";
+          }}
+        }})
+        .catch(function(err) {{
+          document.getElementById("heading").textContent = "Error";
+          document.getElementById("error").style.display = "block";
+          document.getElementById("error").textContent = "Network error: " + err.message;
+          document.getElementById("status").textContent = "";
+        }});
+    }},
+    onExit: function() {{
+      if (document.getElementById("heading").textContent === "Connecting...") {{
+        document.getElementById("heading").textContent = "Cancelled";
+        document.getElementById("status").textContent = "You closed the widget. Refresh to try again.";
+      }}
+    }}
+  }});
+  tellerConnect.open();
+</script>
+</body>
+</html>"""
+
+    return Response(content=html, media_type="text/html")
+
+
+@mcp.custom_route("/callback/teller", methods=["POST"])
+async def callback_teller(request):
+    """Receive enrollment data from the Teller Connect widget."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body."}, status_code=400)
+
+    session_id = body.get("session_id", "")
+    access_token = body.get("access_token", "")
+    enrollment_id = body.get("enrollment_id", "")
+    institution_name = body.get("institution_name", "")
+
+    if not session_id or not access_token:
+        return JSONResponse({"error": "session_id and access_token are required."}, status_code=400)
+
+    session = session_load(session_id)
+    if not session or session.get("provider") != "teller":
+        return JSONResponse({"error": "Session not found or expired."}, status_code=404)
+
+    if session.get("teller_access_token"):
+        return JSONResponse({"error": "Session already activated."}, status_code=409)
+
+    # Fetch accounts from Teller API
+    try:
+        accounts = await _teller_get("/accounts", access_token)
+    except httpx.HTTPStatusError as e:
+        logger.error("Teller accounts fetch failed: %s %s", e.response.status_code, e.response.text)
+        return JSONResponse({"error": "Failed to fetch accounts from Teller."}, status_code=502)
+    except httpx.RequestError as e:
+        logger.error("Teller accounts network error: %s", e)
+        return JSONResponse({"error": "Network error contacting Teller."}, status_code=502)
+
+    session["teller_access_token"] = access_token
+    session["teller_enrollment_id"] = enrollment_id
+    session["institution_name"] = institution_name
+    session["accounts"] = accounts
+    session_save(session_id, session)
+
+    if POKE_API_KEY:
+        asyncio.create_task(forward_to_poke(session_id, session, accounts))
+
+    return JSONResponse({"success": True, "account_count": len(accounts)})
+
+
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
@@ -540,37 +759,83 @@ async def callback(request):
 
 @mcp.tool(
     description=(
-        "Start the Enable Banking authorization flow. Returns an authorization URL "
+        "Start the bank authorization flow. Returns an authorization URL "
         "that the user must open in their browser to grant access to their bank accounts. "
-        "Also returns a session_id that you must pass to create_session after the redirect."
+        "Also returns a session_id. Use provider='teller' for US banks, "
+        "or provider='enable_banking' (default) for EU/Nordic banks."
     )
 )
 async def get_auth_url(
     ctx: Context,
-    aspsp_name: str,
-    aspsp_country: str,
+    aspsp_name: str = "",
+    aspsp_country: str = "",
     psu_type: str = "personal",
+    provider: str = "enable_banking",
 ) -> dict:
     """
-    Start Enable Banking authorization — get a URL for the user to open.
-
-    Automatically requests the maximum consent validity supported by the bank.
+    Start bank authorization — get a URL for the user to open.
 
     Args:
-        aspsp_name: Bank / ASPSP name (e.g. 'Nordea', 'ING', 'Revolut').
-        aspsp_country: Two-letter ISO country code of the bank (e.g. 'FI', 'DE', 'GB').
-        psu_type: Payment service user type — 'personal' or 'business'. Default: 'personal'.
+        aspsp_name: Bank / ASPSP name (e.g. 'Nordea', 'ING'). Required for enable_banking, ignored for teller.
+        aspsp_country: Two-letter ISO country code (e.g. 'FI', 'DE'). Required for enable_banking, ignored for teller.
+        psu_type: Payment service user type — 'personal' or 'business'. Default: 'personal'. Enable Banking only.
+        provider: 'enable_banking' (default) for EU/Nordic banks, 'teller' for US banks.
 
     Returns:
         auth_url: URL the user must open to authorize access.
-        session_id: Opaque identifier — keep this, you'll need it for create_session.
+        session_id: Opaque identifier for subsequent tool calls.
     """
+    if provider == "teller":
+        return _get_auth_url_teller()
+    if provider != "enable_banking":
+        return {"error": f"Unknown provider '{provider}'. Use 'enable_banking' or 'teller'."}
+    return await _get_auth_url_enable_banking(aspsp_name, aspsp_country, psu_type)
+
+
+def _get_auth_url_teller() -> dict:
+    """Create a Teller Connect URL for US bank authorization."""
+    if not TELLER_APP_ID:
+        return {"error": "TELLER_APP_ID must be set."}
+    if not REDIRECT_URI:
+        return {"error": "ENABLE_BANKING_REDIRECT_URI must be set (used as base for Teller connect URL)."}
+
+    local_session_id = secrets.token_urlsafe(32)
+
+    # Derive the connect URL from the Enable Banking redirect URI base
+    base_url = REDIRECT_URI.rsplit("/", 1)[0]
+    connect_url = f"{base_url}/connect/teller?session_id={local_session_id}"
+
+    session_save(
+        local_session_id,
+        {
+            "session_id": local_session_id,
+            "provider": "teller",
+        },
+    )
+
+    return {
+        "auth_url": connect_url,
+        "session_id": local_session_id,
+        "instructions": (
+            "Open auth_url in a browser. You'll see the Teller Connect widget "
+            "to authenticate with your bank. After connecting, use list_accounts "
+            "to see your linked accounts."
+        ),
+    }
+
+
+async def _get_auth_url_enable_banking(
+    aspsp_name: str, aspsp_country: str, psu_type: str
+) -> dict:
+    """Create an Enable Banking authorization URL for EU/Nordic banks."""
     if not APP_ID or not PRIVATE_KEY:
         return {
             "error": "ENABLE_BANKING_APP_ID and ENABLE_BANKING_PRIVATE_KEY must be set."
         }
     if not REDIRECT_URI:
         return {"error": "ENABLE_BANKING_REDIRECT_URI must be set."}
+    if not aspsp_name or not aspsp_country:
+        return {"error": "aspsp_name and aspsp_country are required for enable_banking provider."}
 
     max_seconds = await _get_max_consent_seconds(aspsp_name, aspsp_country)
     if max_seconds:
@@ -608,6 +873,7 @@ async def get_auth_url(
         local_session_id,
         {
             "session_id": local_session_id,
+            "provider": "enable_banking",
             "state": state,
             "authorization_id": authorization_id,
             "aspsp_name": aspsp_name,
@@ -739,6 +1005,33 @@ async def get_transactions(
     session = session_load(session_id)
     if not session:
         return {"error": f"Session '{session_id}' not found."}
+
+    provider = session.get("provider", "enable_banking")
+
+    if provider == "teller":
+        access_token = session.get("teller_access_token")
+        if not access_token:
+            return {"error": "Session not activated. Complete the Teller Connect flow first."}
+        if not _valid_account_id(account_id):
+            return {"error": "Invalid account_id."}
+
+        try:
+            data = await _teller_get(f"/accounts/{account_id}/transactions", access_token)
+        except httpx.HTTPStatusError as e:
+            return {"error": f"Teller API error: {e.response.status_code} {e.response.text}"}
+        except httpx.RequestError as e:
+            return {"error": f"Network error: {e}"}
+
+        # Teller returns a list directly; filter by date client-side if requested
+        transactions = data if isinstance(data, list) else data.get("transactions", [])
+        if date_from:
+            transactions = [t for t in transactions if t.get("date", "") >= date_from]
+        if date_to:
+            transactions = [t for t in transactions if t.get("date", "") <= date_to]
+
+        return {"transactions": transactions}
+
+    # Enable Banking path
     if not session.get("eb_session_id"):
         return {"error": "Session not activated. Call create_session first."}
     if not _valid_account_id(account_id):
@@ -766,7 +1059,7 @@ async def get_transactions(
 async def get_balances(
     ctx: Context,
     session_id: str,
-    account_id: str,
+    account_id: str = "",
 ) -> dict:
     """
     Get balances for a bank account.
@@ -781,6 +1074,26 @@ async def get_balances(
     session = session_load(session_id)
     if not session:
         return {"error": f"Session '{session_id}' not found."}
+
+    provider = session.get("provider", "enable_banking")
+
+    if provider == "teller":
+        access_token = session.get("teller_access_token")
+        if not access_token:
+            return {"error": "Session not activated. Complete the Teller Connect flow first."}
+        if not _valid_account_id(account_id):
+            return {"error": "Invalid account_id."}
+
+        try:
+            data = await _teller_get(f"/accounts/{account_id}/balances", access_token)
+        except httpx.HTTPStatusError as e:
+            return {"error": f"Teller API error: {e.response.status_code} {e.response.text}"}
+        except httpx.RequestError as e:
+            return {"error": f"Network error: {e}"}
+
+        return {"balances": data}
+
+    # Enable Banking path
     if not session.get("eb_session_id"):
         return {"error": "Session not activated. Call create_session first."}
     if not _valid_account_id(account_id):

@@ -27,6 +27,9 @@ venv/
 # mypy
 .mypy_cache/
 
+# OTA version tracking
+.poke_version
+
 # macOS
 .DS_Store
 
