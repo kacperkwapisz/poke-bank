@@ -50,7 +50,7 @@ All config is via environment variables (or `.env` file for Docker Compose).
 | `ENABLE_BANKING_REDIRECT_URI` | Yes | Redirect URL registered with Enable Banking |
 | `SESSION_ENCRYPTION_KEY` | Yes | 64 hex chars (32 bytes) for AES-256-GCM session encryption |
 | `ENABLE_BANKING_BASE` | No | API base URL — defaults to `https://api.enablebanking.com` |
-| `CONSENT_VALIDITY_DAYS` | No | How many days bank consent is valid (default: 90) |
+| `CONSENT_VALIDITY_DAYS` | No | Fallback consent validity in days when ASPSP lookup fails (default: 90). By default the maximum validity supported by the bank is used. |
 | `DB_PATH` | No | SQLite path — defaults to `/data/sessions.db` |
 | `RATE_LIMIT_GET_RPM` | No | GET rate limit per IP (default: 30) |
 | `RATE_LIMIT_POST_RPM` | No | POST rate limit per IP (default: 120) |

@@ -50,8 +50,8 @@ else:
     # Handle escaped newlines from env vars / Docker
     PRIVATE_KEY = _pk_raw.replace("\\n", "\n")
 
-# Default consent validity in days.
-CONSENT_VALIDITY_DAYS = int(os.environ.get("CONSENT_VALIDITY_DAYS", "90"))
+# Fallback consent validity in days (used when ASPSP lookup fails).
+CONSENT_VALIDITY_DAYS_FALLBACK = int(os.environ.get("CONSENT_VALIDITY_DAYS", "90"))
 
 DB_PATH = os.environ.get("DB_PATH", "/data/sessions.db")
 
@@ -331,6 +331,18 @@ async def _api_get(path: str, params: Optional[dict] = None) -> dict:
         return resp.json()
 
 
+async def _get_max_consent_seconds(aspsp_name: str, aspsp_country: str) -> Optional[int]:
+    """Fetch the maximum_consent_validity (seconds) for an ASPSP, or None on failure."""
+    try:
+        data = await _api_get("/aspsps", params={"country": aspsp_country})
+        for aspsp in data.get("aspsps", []):
+            if aspsp.get("name") == aspsp_name:
+                return aspsp.get("maximum_consent_validity")
+    except (httpx.HTTPStatusError, httpx.RequestError):
+        pass
+    return None
+
+
 # UUID or hex string — rejects path traversal characters.
 _ACCOUNT_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
@@ -538,16 +550,16 @@ async def get_auth_url(
     aspsp_name: str,
     aspsp_country: str,
     psu_type: str = "personal",
-    consent_days: int = CONSENT_VALIDITY_DAYS,
 ) -> dict:
     """
     Start Enable Banking authorization — get a URL for the user to open.
+
+    Automatically requests the maximum consent validity supported by the bank.
 
     Args:
         aspsp_name: Bank / ASPSP name (e.g. 'Nordea', 'ING', 'Revolut').
         aspsp_country: Two-letter ISO country code of the bank (e.g. 'FI', 'DE', 'GB').
         psu_type: Payment service user type — 'personal' or 'business'. Default: 'personal'.
-        consent_days: How many days the consent should be valid. Default from CONSENT_VALIDITY_DAYS env var.
 
     Returns:
         auth_url: URL the user must open to authorize access.
@@ -560,10 +572,16 @@ async def get_auth_url(
     if not REDIRECT_URI:
         return {"error": "ENABLE_BANKING_REDIRECT_URI must be set."}
 
+    max_seconds = await _get_max_consent_seconds(aspsp_name, aspsp_country)
+    if max_seconds:
+        consent_duration = timedelta(seconds=max_seconds)
+    else:
+        consent_duration = timedelta(days=CONSENT_VALIDITY_DAYS_FALLBACK)
+
     state = secrets.token_urlsafe(24)
     local_session_id = secrets.token_urlsafe(32)
     valid_until = (
-        datetime.now(timezone.utc) + timedelta(days=consent_days)
+        datetime.now(timezone.utc) + consent_duration
     ).isoformat()
 
     body = {
