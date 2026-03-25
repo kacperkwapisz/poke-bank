@@ -252,6 +252,23 @@ def session_load(session_id: str, db_path: str = DB_PATH) -> Optional[dict]:
         return None
 
 
+def session_find_by_state(state: str, db_path: str = DB_PATH) -> Optional[dict]:
+    """Find a pending session by its OAuth state parameter."""
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute("SELECT session_id, encrypted_data FROM sessions").fetchall()
+    finally:
+        conn.close()
+    for sid, blob in rows:
+        try:
+            data = json.loads(_decrypt(blob))
+        except Exception:
+            continue
+        if data.get("state") == state:
+            return data
+    return None
+
+
 def session_delete(session_id: str, db_path: str = DB_PATH) -> None:
     """Remove a session from SQLite."""
     conn = sqlite3.connect(db_path)
@@ -395,23 +412,68 @@ async def health(request):
 
 @mcp.custom_route("/callback", methods=["GET"])
 async def callback(request):
-    """Handle the Enable Banking redirect after user authorization."""
+    """Handle the Enable Banking redirect — auto-complete the session."""
     code = request.query_params.get("code", "")
     state = request.query_params.get("state", "")
-    if not code:
+
+    _page = (
+        "<html><body style='font-family:system-ui;max-width:480px;margin:40px auto;text-align:center'>"
+        "{body}</body></html>"
+    )
+
+    if not code or not state:
         return Response(
-            content="<html><body><h1>Error</h1><p>Missing authorization code.</p></body></html>",
+            content=_page.format(body="<h1>Error</h1><p>Missing code or state parameter.</p>"),
             media_type="text/html",
             status_code=400,
         )
+
+    # Find the pending session by state
+    session = session_find_by_state(state)
+    if not session:
+        return Response(
+            content=_page.format(body="<h1>Error</h1><p>Session not found or expired.</p>"),
+            media_type="text/html",
+            status_code=404,
+        )
+
+    session_id = session["session_id"]
+
+    # Exchange the code for an Enable Banking session
+    try:
+        data = await _api_post("/sessions", {"code": code})
+    except httpx.HTTPStatusError as e:
+        logger.error("Callback session creation failed: %s %s", e.response.status_code, e.response.text)
+        return Response(
+            content=_page.format(body="<h1>Error</h1><p>Bank session creation failed. Please try again.</p>"),
+            media_type="text/html",
+            status_code=502,
+        )
+    except httpx.RequestError as e:
+        logger.error("Callback network error: %s", e)
+        return Response(
+            content=_page.format(body="<h1>Error</h1><p>Network error. Please try again.</p>"),
+            media_type="text/html",
+            status_code=502,
+        )
+
+    eb_session_id = data.get("session_id", data.get("sessionId", ""))
+    accounts = data.get("accounts", [])
+
+    session["eb_session_id"] = eb_session_id
+    session["accounts"] = accounts
+    session.pop("state", None)
+    session.pop("authorization_id", None)
+    session_save(session_id, session)
+
+    account_count = len(accounts)
     return Response(
-        content=(
-            "<html><body style='font-family:system-ui;max-width:480px;margin:40px auto;text-align:center'>"
-            "<h1>Authorization complete</h1>"
-            "<p>Copy the code below and pass it to <code>create_session</code> along with your <code>session_id</code>.</p>"
-            f"<pre style='background:#f3f3f3;padding:12px;border-radius:6px;word-break:break-all'>{code}</pre>"
-            "<p style='color:#666;font-size:14px'>You can close this tab.</p>"
-            "</body></html>"
+        content=_page.format(
+            body=(
+                "<h1>Connected</h1>"
+                f"<p>{account_count} account{'s' if account_count != 1 else ''} linked.</p>"
+                "<p style='color:#666;font-size:14px'>You can close this tab and return to your assistant.</p>"
+            )
         ),
         media_type="text/html",
     )
