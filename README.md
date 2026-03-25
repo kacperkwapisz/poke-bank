@@ -41,7 +41,7 @@ On the **first run**, `start.sh` automatically handles the full setup:
 5. Prompts you for your `ENABLE_BANKING_APP_ID` (or you can set it manually in `.env` later)
 6. Immediately starts the server and tunnel
 
-After the first run, open `.env` and fill in your Enable Banking credentials (`ENABLE_BANKING_APP_ID`, `ENABLE_BANKING_PRIVATE_KEY`, `ENABLE_BANKING_REDIRECT_URI`) if you haven't already, then run `./start.sh` again.
+After the first run, open `.env` and fill in your provider credentials — Enable Banking (`ENABLE_BANKING_APP_ID`, `ENABLE_BANKING_PRIVATE_KEY`, `ENABLE_BANKING_REDIRECT_URI`) for EU/Nordic banks and/or Teller (`TELLER_APP_ID`, `TELLER_CERT`, `TELLER_KEY`) for US banks — then run `./start.sh` again.
 
 On **subsequent runs**, `start.sh` skips setup and goes straight to starting the server and tunnel.
 
@@ -50,7 +50,7 @@ On **subsequent runs**, `start.sh` skips setup and goes straight to starting the
 Copy this prompt into your AI coding agent (Claude Code, Cursor, etc.):
 
 ```text
-Set up poke-bank (https://github.com/kacperkwapisz/poke-bank) for me — clone the repo, run 'npx poke login' so I can authenticate with Poke (wait for me to confirm), then run './start.sh' which will automatically wire up my Poke API key, generate an MCP_API_KEY and SESSION_ENCRYPTION_KEY, set up the virtualenv, and start the server and tunnel — it will prompt me for my ENABLE_BANKING_APP_ID (I need to get this from the Enable Banking dashboard first); if I don't have Enable Banking credentials yet, guide me through the setup: go to https://enablebanking.com, create an application, generate an RSA key pair (openssl genrsa -out private.pem 2048 && openssl rsa -in private.pem -pubout -out public.pem), upload the public key to the dashboard, copy the Application ID, and set ENABLE_BANKING_REDIRECT_URI to https://<my-domain>/callback — do NOT type passwords or secrets, tell me to enter those myself and confirm when done; if the server fails due to missing credentials, have me update .env and run './start.sh' again.
+Set up poke-bank (https://github.com/kacperkwapisz/poke-bank) for me — clone the repo, run 'npx poke login' so I can authenticate with Poke (wait for me to confirm), then run './start.sh' which will automatically wire up my Poke API key, generate an MCP_API_KEY and SESSION_ENCRYPTION_KEY, set up the virtualenv, and start the server and tunnel — it will prompt me for my ENABLE_BANKING_APP_ID (I need to get this from the Enable Banking dashboard first). poke-bank supports two bank providers: Enable Banking for EU/Nordic banks and Teller for US banks. For Enable Banking: go to https://enablebanking.com, create an application, generate an RSA key pair (openssl genrsa -out private.pem 2048 && openssl rsa -in private.pem -pubout -out public.pem), upload the public key to the dashboard, copy the Application ID, and set ENABLE_BANKING_REDIRECT_URI to https://<my-domain>/callback. For Teller (US banks): go to https://teller.io, create an application, copy the Application ID into TELLER_APP_ID, and download the mTLS certificate (teller.zip) — extract certificate.pem and private_key.pem and set TELLER_CERT and TELLER_KEY to their paths (not needed for sandbox). Either provider or both can be configured. Do NOT type passwords or secrets, tell me to enter those myself and confirm when done; if the server fails due to missing credentials, have me update .env and run './start.sh' again.
 ```
 
 ## Enable Banking Setup
